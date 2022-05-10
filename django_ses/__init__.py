@@ -1,6 +1,7 @@
 import logging
 
 import boto3
+import redis
 from botocore.vendored.requests.packages.urllib3.exceptions import ResponseError
 from django.core.mail.backends.base import BaseEmailBackend
 from django_ses import settings
@@ -62,6 +63,7 @@ class SESBackend(BaseEmailBackend):
                  aws_region_endpoint=None, aws_auto_throttle=None, aws_config=None,
                  dkim_domain=None, dkim_key=None, dkim_selector=None, dkim_headers=None,
                  ses_source_arn=None, ses_from_arn=None, ses_return_path_arn=None,
+                 throttling_strategy=None, redis_connection_string=None, throttling_cache_key=None,
                  **kwargs):
 
         super(SESBackend, self).__init__(fail_silently=fail_silently, **kwargs)
@@ -82,6 +84,22 @@ class SESBackend(BaseEmailBackend):
         self.ses_return_path_arn = ses_return_path_arn or settings.AWS_SES_RETURN_PATH_ARN
 
         self.connection = None
+
+        self.throttling_strategy = throttling_strategy or settings.AWS_SES_THROTTLING_STRATEGY or 'memory'
+        self.redis_connection_string = redis_connection_string or settings.AWS_SES_REDIS_CONNECTION_STRING
+        self.throttling_cache_key = throttling_cache_key or settings.AWS_SES_REDIS_THROTTLING_CACHE_KEY or 'ses_throttling'
+        self.redis_client = None
+        self.throttling_script = None
+        
+        if self._throttle:
+            if self.throttling_strategy.lower() not in ['memory', 'redis']:
+                raise ValueError("Throttling strategy should be either `memory` or `redis`")
+            if self.throttling_strategy.lower() == 'redis':
+                if not self.redis_connection_string:
+                    raise Exception("You have to provide `AWS_SES_REDIS_CONNECTION_STRING` if you choose redis as throttling strategy")
+
+                self.redis_client = redis.from_url(url=self.redis_connection_string, decode_responses=True)
+                self.throttling_script = self.register_redis_throttling_script()
 
     def open(self):
         """Create a connection to the AWS API server. This can be reused for
@@ -146,52 +164,11 @@ class SESBackend(BaseEmailBackend):
                     message.extra_headers[
                         'X-SES-CONFIGURATION-SET'] = settings.AWS_SES_CONFIGURATION_SET
 
-            # Automatic throttling. Assumes that this is the only SES client
-            # currently operating. The AWS_SES_AUTO_THROTTLE setting is a
-            # factor to apply to the rate limit, with a default of 0.5 to stay
-            # well below the actual SES throttle.
-            # Set the setting to 0 or None to disable throttling.
             if self._throttle:
-                global recent_send_times
-
-                now = datetime.now()
-
-                # Get and cache the current SES max-per-second rate limit
-                # returned by the SES API.
-                rate_limit = self.get_rate_limit()
-                logger.debug("send_messages.throttle rate_limit='{}'".format(rate_limit))
-
-                # Prune from recent_send_times anything more than a few seconds
-                # ago. Even though SES reports a maximum per-second, the way
-                # they enforce the limit may not be on a one-second window.
-                # To be safe, we use a two-second window (but allow 2 times the
-                # rate limit) and then also have a default rate limit factor of
-                # 0.5 so that we really limit the one-second amount in two
-                # seconds.
-                window = 2.0  # seconds
-                window_start = now - timedelta(seconds=window)
-                new_send_times = []
-                for time in recent_send_times:
-                    if time > window_start:
-                        new_send_times.append(time)
-                recent_send_times = new_send_times
-
-                # If the number of recent send times in the last 1/_throttle
-                # seconds exceeds the rate limit, add a delay.
-                # Since I'm not sure how Amazon determines at exactly what
-                # point to throttle, better be safe than sorry and let in, say,
-                # half of the allowed rate.
-                if len(new_send_times) > rate_limit * window * self._throttle:
-                    # Sleep the remainder of the window period.
-                    delta = now - new_send_times[0]
-                    total_seconds = (delta.microseconds + (delta.seconds +
-                                     delta.days * 24 * 3600) * 10**6) / 10**6
-                    delay = window - total_seconds
-                    if delay > 0:
-                        sleep(delay)
-
-                recent_send_times.append(now)
-                # end of throttling
+                if self.redis_client:
+                    self.throttle_requests_using_redis()
+                else:
+                    self.throttle_requests_using_local_memory()
 
             kwargs = dict(
                 Source=source or message.from_email,
@@ -265,3 +242,84 @@ class SESBackend(BaseEmailBackend):
         finally:
             if new_conn_created:
                 self.close()
+
+    def throttle_requests_using_local_memory(self):
+        # Automatic throttling. Assumes that this is the only SES client
+        # currently operating. The AWS_SES_AUTO_THROTTLE setting is a
+        # factor to apply to the rate limit, with a default of 0.5 to stay
+        # well below the actual SES throttle.
+        # Set the setting to 0 or None to disable throttling.
+        global recent_send_times
+        now = datetime.now()
+
+        # Get and cache the current SES max-per-second rate limit
+        # returned by the SES API.
+        rate_limit = self.get_rate_limit()
+        logger.debug("send_messages.throttle rate_limit='{}'".format(rate_limit))
+
+        # Prune from recent_send_times anything more than a few seconds
+        # ago. Even though SES reports a maximum per-second, the way
+        # they enforce the limit may not be on a one-second window.
+        # To be safe, we use a two-second window (but allow 2 times the
+        # rate limit) and then also have a default rate limit factor of
+        # 0.5 so that we really limit the one-second amount in two
+        # seconds.
+        window = 2.0  # seconds
+        window_start = now - timedelta(seconds=window)
+        new_send_times = []
+        for time in recent_send_times:
+            if time > window_start:
+                new_send_times.append(time)
+        recent_send_times = new_send_times
+
+        # If the number of recent send times in the last 1/_throttle
+        # seconds exceeds the rate limit, add a delay.
+        # Since I'm not sure how Amazon determines at exactly what
+        # point to throttle, better be safe than sorry and let in, say,
+        # half of the allowed rate.
+        if len(new_send_times) > rate_limit * window * self._throttle:
+            # Sleep the remainder of the window period.
+            delta = now - new_send_times[0]
+            total_seconds = (delta.microseconds + (delta.seconds +
+                                delta.days * 24 * 3600) * 10**6) / 10**6
+            delay = window - total_seconds
+            if delay > 0:
+                sleep(delay)
+
+        recent_send_times.append(now)
+    
+
+    def register_redis_throttling_script(self):
+        rate_limit = self.get_rate_limit()
+        window = 1
+        script = f"""
+            -- Set variables from arguments
+            local cache_key = KEYS[1]
+            local now = tonumber(redis.call('TIME')[1])
+            local window = tonumber({window})
+            local limit = tonumber({rate_limit}) * tonumber({self._throttle})
+
+            -- Remove keys older than now - window
+            local clearBefore = now - window
+            redis.call('ZREMRANGEBYSCORE', cache_key, 0, clearBefore)
+            
+            -- Get already sent count
+            local already_sent = redis.call('ZCARD', cache_key)
+
+            -- if allowed, then add to sorted set
+            if already_sent < limit then
+                redis.call('ZADD', cache_key, now, now)
+            end
+
+            -- for cleanup, expire the whole set in <window> secs
+            redis.call('EXPIRE', cache_key, window)
+            
+            -- return the remaining amount of requests.
+            return limit - already_sent
+        """.encode("utf-8")
+
+        self.throttling_script = self.redis_client.register_script(script)
+
+    def throttle_requests_using_redis(self):
+        while self.throttling_script(self.throttling_cache_key) <= 0:
+            sleep(1)
